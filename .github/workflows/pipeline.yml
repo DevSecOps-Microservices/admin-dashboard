@@ -1,0 +1,114 @@
+name: DevSecOps Pipeline - admin-dashboard
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+jobs:
+  security-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Secret detection (GitLeaks)
+        run: |
+          wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz
+          tar -xzf gitleaks_8.18.2_linux_x64.tar.gz
+          ./gitleaks detect --source . --verbose --no-git
+        continue-on-error: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Dependency scan (Snyk)
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+      - name: SonarCloud analysis
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=DevSecOps-Microservices_admin-dashboard
+            -Dsonar.organization=devsecops-microservices
+            -Dsonar.sources=src
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg REACT_APP_API_URL=http://localhost:8880 \
+            --build-arg REACT_APP_KEYCLOAK_URL=http://localhost:8080 \
+            -t admin-dashboard:latest .
+
+      - name: Scan Docker image (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: admin-dashboard:latest
+          format: table
+          exit-code: '0'
+          severity: CRITICAL,HIGH
+
+      - name: Trivy SARIF report
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: admin-dashboard:latest
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+
+      - name: Upload Trivy to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Docker image
+        run: |
+          docker tag admin-dashboard:latest ghcr.io/devsecops-microservices/admin-dashboard:latest
+          docker push ghcr.io/devsecops-microservices/admin-dashboard:latest
+
+      - name: Deploy admin-dashboard
+        run: |
+          docker stop admin-dashboard || true
+          docker rm admin-dashboard || true
+          docker pull ghcr.io/devsecops-microservices/admin-dashboard:latest
+          docker run -d \
+            --name admin-dashboard \
+            -p 4200:4200 \
+            --restart unless-stopped \
+            ghcr.io/devsecops-microservices/admin-dashboard:latest
+          sleep 10
+          echo "admin-dashboard deployed successfully"
+
+      - name: Verify deployment
+        run: |
+          docker ps | grep admin-dashboard
+          echo "Container is running"
